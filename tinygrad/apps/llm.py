@@ -9,7 +9,8 @@ from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3"):
     preset = {"qwen35":"qwen2","qwen35moe":"qwen2"}.get(preset, preset)
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","gemma4","tekken"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
+    valid_presets = ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","gemma4","tekken")
+    if preset not in valid_presets: raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
     self._byte_decoder = {chr(b): b for b in bs} | {chr(256+i): b for i,b in enumerate(b for b in range(256) if b not in bs)}
@@ -45,7 +46,8 @@ class SimpleTokenizer:
     if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
     # for gemma4 (sentencepiece), split by UTF-8 chars then byte-fallback unknown chars; for BPE presets, split by bytes
     if self._byte_tokens:
-      parts = [cb for c in word.decode('utf-8', errors='replace') for cb in ([c.encode()] if c.encode() in self._normal_tokens else [bytes([b]) for b in c.encode()])]
+      def _char_parts(c:str) -> list[bytes]: return [c.encode()] if c.encode() in self._normal_tokens else [bytes([b]) for b in c.encode()]
+      parts = [cb for c in word.decode('utf-8', errors='replace') for cb in _char_parts(c)]
     else: parts = [bytes([b]) for b in word]
     # greedily merge any parts that we can
     while True:
@@ -173,6 +175,7 @@ class TransformerConfig:
   routed_scaling_factor: float = 1.0
   sliding_window: int = 0
   sliding_window_pattern: tuple[bool, ...] = ()
+  alt_attn_pattern: tuple[bool, ...] = ()
   per_layer_input_dim: int = 0
   final_logit_softcap: float = 0.0
   num_kv_shared_layers: int = 0
@@ -182,7 +185,11 @@ class TransformerConfig:
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
     self.config = config
+    assert isinstance(config.hidden_dim, int)
     self.hidden_dim = config.hidden_dim
+    self.store_full_length_kv = False
+    self.shared_kv_src_idx: int|None = None
+    self.full_kv_cache: Tensor|None = None
     gemma_moe = config.gemma4 and config.num_experts > 0
 
     # --- RMSNorms --------------------------------------------------------
@@ -258,7 +265,7 @@ class FFNBlock:
   def _init_state(self, x:Tensor): raise NotImplementedError
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
 
-  def __call__(self, x: Tensor, start_pos: int|UOp):
+  def __call__(self, x: Tensor, start_pos: int|UOp, per_layer_input:Tensor|None=None, shared_kv_cache:Tensor|None=None):
     self._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
@@ -270,15 +277,14 @@ class FFNBlock:
 class TransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
     super().__init__(config)
+    assert isinstance(config.head_dim, int) and isinstance(config.n_kv_heads, int) and isinstance(config.qk_norm, int)
     self.head_dim = config.head_dim
     self.rope_theta = config.rope_theta
     self.qk_norm = config.qk_norm
     self.n_kv_heads = config.n_kv_heads
     self.is_sliding = config.sliding_window > 0 and bool(config.sliding_window_pattern) and config.sliding_window_pattern[0]
-    self.use_alternative_attention = config.gemma4 and config.num_experts > 0 and not self.is_sliding
-    self.store_full_length_kv = False
-    self.shared_kv_src_idx: int|None = None
-    self.full_kv_cache: Tensor|None = None
+    self.is_alt_attn = bool(config.alt_attn_pattern) and config.alt_attn_pattern[0]
+    self.use_alternative_attention = config.gemma4 and ((config.num_experts > 0 and not self.is_sliding) or self.is_alt_attn)
     if not config.gemma4: assert config.v_head_dim == self.head_dim, "TransformerBlock requires v_head_dim == head_dim"
 
     # --- attention projections (all linear, bias-free) ------------------
@@ -390,6 +396,7 @@ class TransformerBlock(FFNBlock):
 class MLATransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
     super().__init__(config)
+    assert isinstance(config.head_dim, int)
     qk_nope_head_dim = config.head_dim - config.rope_dim
     self.attn_q = nn.Linear(config.dim, config.n_heads * config.head_dim, bias=False)
     self.attn_kv_a_mqa = nn.Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
@@ -399,6 +406,7 @@ class MLATransformerBlock(FFNBlock):
     self.attn_output = nn.Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+    assert isinstance(self.config.head_dim, int)
     B, T, _ = x.shape
     q_nope_head_dim = self.config.head_dim - self.config.rope_dim
     q = self.attn_q(x).reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
@@ -501,16 +509,17 @@ class Transformer:
         head_dim=config.head_dim[i] if isinstance(config.head_dim, tuple) else config.head_dim,
         rope_theta=config.rope_theta[i] if isinstance(config.rope_theta, tuple) else config.rope_theta,
         qk_norm=config.qk_norm[i] if isinstance(config.qk_norm, tuple) else config.qk_norm,
-        sliding_window_pattern=(config.sliding_window_pattern[i],) if config.sliding_window_pattern else ())
+        sliding_window_pattern=(config.sliding_window_pattern[i],) if config.sliding_window_pattern else (),
+        alt_attn_pattern=(config.alt_attn_pattern[i],) if config.alt_attn_pattern else ())
     if config.gemma4:
-      self.blk = [TransformerBlock(layer_config(i)) for i in range(config.num_blocks)]
+      self.blk: list[FFNBlock] = [TransformerBlock(layer_config(i)) for i in range(config.num_blocks)]
     else:
       dense_config = replace(
         config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0,
         hidden_dim=config.dense_hidden_dim or config.hidden_dim)
       if config.ssm: config = replace(config, qk_norm=config.head_dim)
       block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
-      self.blk:list[FFNBlock] = [GatedDeltaNetBlock(config, config.ssm) if config.ssm and (i+1) % config.full_attention_interval != 0 else
+      self.blk = [GatedDeltaNetBlock(config, config.ssm) if config.ssm and (i+1) % config.full_attention_interval != 0 else
                                  block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
@@ -611,6 +620,7 @@ class Transformer:
       rope_theta = tuple(
         kv.get(f'{arch}.rope.freq_base_swa', kv[f'{arch}.rope.freq_base']) if is_sliding else kv[f'{arch}.rope.freq_base']
         for is_sliding in sliding_window_pattern)
+      alt_attn_pattern = tuple(f'blk.{i}.attn_v.weight' not in state_dict for i in range(kv[f'{arch}.block_count']))
     else:
       sliding_window_pattern = ()
       rope_theta = kv[f'{arch}.rope.freq_base']
@@ -647,7 +657,8 @@ class Transformer:
       final_logit_softcap=kv.get(f'{arch}.final_logit_softcapping', 0.0),
       num_kv_shared_layers=kv.get(f'{arch}.attention.shared_kv_layers', 0),
       gemma4=arch == 'gemma4',
-      expert_hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', 0))
+      expert_hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', 0),
+      alt_attn_pattern=alt_attn_pattern if arch == 'gemma4' else ())
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
@@ -759,9 +770,18 @@ class Handler(HTTPRequestHandler):
     finish_reason = "stop"
     st = time.perf_counter()
     dec = tok.stream_decoder()
+    in_channel = False
     for next_id in model.generate(ids, temperature=temperature):
       if len(out) == 0: stderr_log(f"prefill:{(len(ids)-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
-      if next_id == eos_id: break
+      if next_id in stop_ids: break
+      if next_id == channel_start_id:
+        in_channel = True
+        continue
+      if next_id == channel_end_id:
+        in_channel = False
+        dec = tok.stream_decoder()
+        continue
+      if in_channel: continue
       out.append(next_id)
       yield {"choices": [{"index":0, "delta":{"content":dec(next_id)}, "finish_reason":None}], **tmpl}
       if max_tokens is not None and len(out) >= max_tokens:
@@ -831,8 +851,12 @@ if __name__ == "__main__":
   gc.collect()
 
   tok = SimpleTokenizer.from_gguf_kv(kv)
-  bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None
+  bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) or tok.preset == 'gemma4' else None
   eos_id: int = kv['tokenizer.ggml.eos_token_id']
+  eot_id: int = kv.get('tokenizer.ggml.eot_token_id', eos_id)
+  stop_ids: set[int] = {eos_id, eot_id}
+  channel_start_id: int|None = tok._special_tokens.get('<|channel>')
+  channel_end_id: int|None = tok._special_tokens.get('<channel|>')
 
   # warmup the JIT
   if args.warmup or args.serve:
@@ -861,7 +885,19 @@ if __name__ == "__main__":
     except EOFError:
       break
     dec = tok.stream_decoder()
+    in_channel = False
     for next_id in model.generate(ids):
-      sys.stdout.write(dec(next_id) if next_id != eos_id else dec() + "\n\n")
+      if next_id in stop_ids:
+        sys.stdout.write(dec() + "\n\n")
+        sys.stdout.flush()
+        break
+      if next_id == channel_start_id:
+        in_channel = True
+        continue
+      if next_id == channel_end_id:
+        in_channel = False
+        dec = tok.stream_decoder()
+        continue
+      if in_channel: continue
+      sys.stdout.write(dec(next_id))
       sys.stdout.flush()
-      if next_id == eos_id: break
