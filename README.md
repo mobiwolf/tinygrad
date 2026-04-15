@@ -206,15 +206,19 @@ tinygrad includes a built-in LLM chat app at [`tinygrad/apps/llm.py`](tinygrad/a
 
 ### Quick start
 
+Interactive chat uses `input()` which has limited line-editing support for CJK (Chinese/Japanese/Korean) input. Wrap with [rlwrap](https://github.com/hanslub42/rlwrap) for proper readline behavior:
+
 ```sh
+# install rlwrap (macOS / Linux)
+brew install rlwrap   # or: apt install rlwrap
+
 # run a built-in model by name (downloads automatically)
-python3 tinygrad/apps/llm.py --model llama3.2:1b
+DEV=AMD rlwrap python3 tinygrad/apps/llm.py --model llama3.2:1b
 
 # run a local GGUF file
-python3 tinygrad/apps/llm.py --model /path/to/model.gguf
+rlwrap python3 tinygrad/apps/llm.py --model /path/to/model.gguf
 
-# use a specific device
-DEV=AMD python3 tinygrad/apps/llm.py --model qwen3:8b
+# without rlwrap (works fine for ASCII-only input)
 DEV=METAL python3 tinygrad/apps/llm.py --model gemma4:e2b-q4
 ```
 
@@ -227,7 +231,7 @@ If you have models downloaded via [Ollama](https://ollama.com), you can point di
 ollama show <model> --modelfile | grep 'FROM /'
 
 # pass the blob path to llm.py
-DEV=AMD python3 tinygrad/apps/llm.py \
+DEV=AMD rlwrap python3 tinygrad/apps/llm.py \
   --model ~/.ollama/models/blobs/<sha256-hash> \
   --temperature 0.8 --repeat_penalty 1.1
 ```
