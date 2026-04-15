@@ -199,3 +199,68 @@ python3 -m pytest test/                 # whole test suite
 #### Process replay tests
 
 [Process replay](https://github.com/tinygrad/tinygrad/blob/master/test/external/process_replay/README.md) compares your PR's generated kernels against master. If your PR is a refactor or speedup without any expected behavior change, It should include [pr] in the pull request title.
+
+## LLM Inference
+
+tinygrad includes a built-in LLM chat app at [`tinygrad/apps/llm.py`](tinygrad/apps/llm.py). It loads GGUF models (from HuggingFace URLs or local files) and runs interactive multi-turn chat.
+
+### Quick start
+
+```sh
+# run a built-in model by name (downloads automatically)
+python3 tinygrad/apps/llm.py --model llama3.2:1b
+
+# run a local GGUF file
+python3 tinygrad/apps/llm.py --model /path/to/model.gguf
+
+# use a specific device
+DEV=AMD python3 tinygrad/apps/llm.py --model qwen3:8b
+DEV=METAL python3 tinygrad/apps/llm.py --model gemma4:e2b-q4
+```
+
+### Using Ollama models
+
+If you have models downloaded via [Ollama](https://ollama.com), you can point directly to the GGUF blob:
+
+```sh
+# find the blob path for your model
+ollama show <model> --modelfile | grep 'FROM /'
+
+# pass the blob path to llm.py
+DEV=AMD python3 tinygrad/apps/llm.py \
+  --model ~/.ollama/models/blobs/<sha256-hash> \
+  --temperature 0.8 --repeat_penalty 1.1
+```
+
+### Sampling options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--temperature` | 0.0 | Sampling temperature. 0=greedy, 0.7–0.8=creative |
+| `--repeat_penalty` | 1.0 | Penalize repeated tokens. 1.0=off, 1.1=recommended |
+| `--max_context` | 4096 | Max context length |
+
+### Available models
+
+| Name | Size | Architecture |
+|------|------|--------------|
+| `llama3.2:1b` | Q6_K | LLaMA 3.2 1B |
+| `llama3.2:3b` | Q6_K | LLaMA 3.2 3B |
+| `llama3.1:8b` | Q8_0 | LLaMA 3.1 8B |
+| `qwen3:8b` | Q4_K_M | Qwen3 8B |
+| `qwen3.5:4b` | Q4_K_M | Qwen3.5 4B |
+| `gemma4:e2b-q4` | Q4_K_M | Gemma 4 E2B |
+| `gemma4:31b-q4` | Q4_K_M | Gemma 4 31B |
+
+Run `python3 tinygrad/apps/llm.py -h` for the full model list and all options.
+
+### Other modes
+
+```sh
+# OpenAI-compatible API server
+python3 tinygrad/apps/llm.py --model qwen3:8b --serve
+python3 tinygrad/apps/llm.py --model qwen3:8b --serve 9000  # custom port
+
+# benchmark tok/s
+python3 tinygrad/apps/llm.py --model llama3.2:1b --benchmark
+```
