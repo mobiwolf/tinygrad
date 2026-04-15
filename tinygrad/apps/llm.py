@@ -75,7 +75,8 @@ class SimpleTokenizer:
     if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
     if self.preset == 'kimi-k2': return self.encode("<|im_" + role + "|>" + role + "<|im_middle|>")
     if self.preset == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
-    if self.preset == 'gemma4': return self.encode("<|turn>" + ("model" if role == "assistant" else role) + "\n")
+    if self.preset == 'gemma4': return self.encode("<|turn>" + ("model" if role == "assistant" else role) + "\n") + \
+      (self.encode("<|channel>thought\n<channel|>") if role == "assistant" else [])
     if self.preset == 'tekken':
       if role == 'user': return self.encode("[INST]")
       if role == 'assistant': return []
@@ -838,6 +839,7 @@ if __name__ == "__main__":
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0=greedy, 0.7=creative, default: 0.0)")
   args = parser.parse_args()
 
   # load the model
@@ -855,7 +857,7 @@ if __name__ == "__main__":
   bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) or tok.preset == 'gemma4' else None
   eos_id: int = kv['tokenizer.ggml.eos_token_id']
   eot_id: int = kv.get('tokenizer.ggml.eot_token_id', eos_id)
-  stop_ids: set[int] = {eos_id, eot_id}
+  stop_ids: set[int] = {eos_id, eot_id} | ({tok._special_tokens['<turn|>']} if tok.preset == 'gemma4' else set())
   channel_start_id: int|None = tok._special_tokens.get('<|channel>')
   channel_end_id: int|None = tok._special_tokens.get('<channel|>')
 
@@ -887,7 +889,7 @@ if __name__ == "__main__":
       break
     dec = tok.stream_decoder()
     in_channel = False
-    for next_id in model.generate(ids):
+    for next_id in model.generate(ids, temperature=args.temperature):
       if next_id in stop_ids:
         sys.stdout.write(dec() + "\n\n")
         sys.stdout.flush()
