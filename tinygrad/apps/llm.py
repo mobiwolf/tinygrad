@@ -550,7 +550,7 @@ class Transformer:
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, repeat_penalty:Tensor) -> Tensor:
     x = self.token_embd(tokens).float() * self.embed_scale                   # (B, T, D)
     if not self.config.gemma4:
       for block in self.blk: x = block(x, start_pos)
@@ -568,11 +568,12 @@ class Transformer:
         x = block(x, start_pos, None if per_layer_inputs is None else per_layer_inputs[:,:,i,:], shared_kv_cache)
     logits = self.output(self.output_norm(x))[:, -1, :]
     if self.final_logit_softcap: logits = (logits / self.final_logit_softcap).tanh() * self.final_logit_softcap
+    logits = logits * repeat_penalty
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
-  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
+  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, repeat_penalty:Tensor) -> Tensor:
+    return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature, repeat_penalty)
 
   @staticmethod
   def from_gguf(gguf:Tensor, max_context:int|None=None, realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
@@ -672,12 +673,13 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, repeat_penalty:float=1.0, repeat_last_n:int=64):
     if self.has_recurrent_block: chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor(temperature).contiguous()
+    rp = Tensor.ones(1, self.config.vocab_size).contiguous()
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
@@ -686,12 +688,15 @@ class Transformer:
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp, rp).realize()
       start_pos += nt.val
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
+      if repeat_penalty != 1.0:
+        recent = list(set(tokens[-repeat_last_n:]))
+        rp = Tensor.ones(1, self.config.vocab_size).scatter(1, Tensor(recent, dtype='int32').reshape(1, -1), 1.0 / repeat_penalty).contiguous()
       yield tokens[-1]
 
 models = {
@@ -840,6 +845,7 @@ if __name__ == "__main__":
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0=greedy, 0.7=creative, default: 0.0)")
+  parser.add_argument("--repeat_penalty", type=float, default=1.0, help="Repeat penalty (1.0=off, 1.1=default for most models)")
   args = parser.parse_args()
 
   # load the model
@@ -889,7 +895,7 @@ if __name__ == "__main__":
       break
     dec = tok.stream_decoder()
     in_channel = False
-    for next_id in model.generate(ids, temperature=args.temperature):
+    for next_id in model.generate(ids, temperature=args.temperature, repeat_penalty=args.repeat_penalty):
       if next_id in stop_ids:
         sys.stdout.write(dec() + "\n\n")
         sys.stdout.flush()
